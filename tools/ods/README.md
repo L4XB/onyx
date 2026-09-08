@@ -296,6 +296,11 @@ package's floor. `--check` fails when a package drops below its floor, which is
 what `pr-golang-tests.yml` runs on every PR. After adding tests, `--update`
 raises the floors.
 
+The floors are the gate, but they are not always a good comparison: they go
+stale, so the report shows gains the current change never made. Give `--base` a
+commit and the report compares against the coverage snapshot of that commit
+instead. A PR then sees only what it changed.
+
 Coverage is measured per package with `go test -coverprofile`, so a package's
 number counts only its own tests. That is a number the package's owner can act
 on; a cross-package `-coverpkg` total would credit a package for statements its
@@ -315,6 +320,9 @@ suite name, which is what CI passes.
 | `--html` | | Render the profile as a browsable page at this path |
 | `--markdown` | | Write the changed packages as a markdown table at this path, for a PR comment |
 | `--tolerance` | `0.1` | Percentage points a package may drop below its floor without failing |
+| `--base` | | Report against the coverage snapshot of this commit instead of the floors |
+| `--publish` | `false` | Record this run as the snapshot of `HEAD` (needs AWS credentials) |
+| `--snapshot-bucket` | `onyx-playwright-artifacts` | S3 bucket that holds the snapshots |
 
 **Examples:**
 
@@ -328,10 +336,37 @@ ods coverage ods --check
 # Record today's numbers as the new floors
 ods coverage ods --update
 
+# Compare your branch against main (fetch first, so origin/main is current)
+git fetch origin
+ods coverage ods --base origin/main
+
 # Keep the profile and browse the uncovered lines
 ods coverage ods --profile /tmp/cover.out
 go tool cover -html=/tmp/cover.out
 ```
+
+#### Comparing against the base
+
+A snapshot records the exact per-package statement counts of one commit. Each
+snapshot is a YAML object in S3 at
+`s3://<bucket>/coverage/<module>/<commit sha>.yaml`, where the module directory
+keeps its shape with `/` replaced by `-`: `tools/ods` becomes `tools-ods`. Runs
+on `main` and on `release/**` write them with `--publish`, which needs AWS
+credentials, refuses a dirty tree, and only records a fully successful run.
+
+`--base <commit-ish>` resolves the base commit first: the merge base of that
+revision and `HEAD` when there is one, which is the fork point of your branch,
+else the revision itself. That is what CI passes, where the given SHA is already
+the base. The command then walks the first-parent history from the base, at most
+25 commits, and reports against the first snapshot it finds. It logs the distance
+when the snapshot is not on the base commit itself.
+
+With a snapshot, the report column reads `Base` instead of `Floor`. Without one,
+or when the revision cannot be fetched, the command prints a warning and reports
+against the floors, which is the behavior without `--base`.
+
+`--base` never changes what the check does. The committed floors stay the only
+gate.
 
 #### Raising the baseline
 
@@ -344,10 +379,20 @@ Without a baseline the tests still run and the report prints, but nothing is
 gated. A module opts into the gate by committing a baseline, so `cli` and
 `terraform-provider-onyx` join by running `ods coverage <suite> --update` once.
 
+A PR run adds `--base <base sha>`. A merge queue run on `main`, and a push to a
+`release/**` branch, also add `--publish`, so the commit that lands gets its
+snapshot. A fork PR cannot assume the AWS role, so it reads no snapshot and
+falls back to the floors. After this change lands, run the workflow once by hand
+(`workflow_dispatch` on `main`) to publish the first snapshots.
+
+Against a base, a module without a baseline still reports what moved, so `cli`
+and `terraform-provider-onyx` can now appear in the PR comment. The check still
+gates nothing for them.
+
 In CI, each module's `--markdown` report goes to the job summary, and its
 `--html` page is uploaded as an artifact and published to the reports bucket.
-One PR comment, updated in place, lists the modules with a baseline where a
-package moved, each with a link to its page.
+One PR comment, updated in place, lists the modules where a package moved, each
+with a link to its page.
 
 Floors are rounded down to one decimal, and a package may sit `--tolerance`
 below its floor without failing. That absorbs the jitter from suites that depend

@@ -41,10 +41,38 @@ func (s *S3URL) HTTPEndpoint() string {
 	return fmt.Sprintf("https://%s.s3.amazonaws.com/%s", s.Bucket, s.Key)
 }
 
+// logFunc writes a progress line. FetchToFile uses log.Infof; the quiet
+// variant uses log.Debugf.
+type logFunc func(format string, args ...any)
+
+// HTTPStatusError reports an unsigned GET that S3 answered with a non-200 status.
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Status)
+}
+
 // FetchToFile downloads an S3 object to a local file.
 // It first tries an unsigned HTTP request and if that fails,
 // tries a signed request using AWS CLI.
 func FetchToFile(s3url string, destPath string) error {
+	return fetch(s3url, destPath, false)
+}
+
+// FetchToFileQuiet downloads an S3 object like FetchToFile but logs only at
+// debug level and returns the reasons both attempts failed. Use it to probe
+// for an object that is often absent.
+func FetchToFileQuiet(s3url string, destPath string) error {
+	return fetch(s3url, destPath, true)
+}
+
+// fetch downloads an S3 object, unsigned first and signed second. quiet keeps
+// every line at debug level, captures the aws CLI output, and reports both
+// failures to the caller instead of the interactive authentication hint.
+func fetch(s3url string, destPath string, quiet bool) error {
 	parsed, err := ParseS3URL(s3url)
 	if err != nil {
 		return err
@@ -55,26 +83,46 @@ func FetchToFile(s3url string, destPath string) error {
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	// Try unsigned HTTP request first
-	log.Info("Attempting unsigned download...")
-	if err := fetchUnsigned(parsed, destPath); err == nil {
-		return nil
-	} else {
-		log.Debugf("Unsigned download failed: %v", err)
+	progress := logFunc(log.Infof)
+	if quiet {
+		progress = log.Debugf
 	}
+
+	// Try unsigned HTTP request first
+	progress("Attempting unsigned download...")
+	unsignedErr := fetchUnsigned(parsed.HTTPEndpoint(), destPath, progress)
+	if unsignedErr == nil {
+		return nil
+	}
+	log.Debugf("Unsigned download failed: %v", unsignedErr)
 
 	// Try signed request using AWS CLI
-	log.Info("Unsigned download failed, attempting signed download...")
-	if err := fetchWithAWSCLI(s3url, destPath); err != nil {
-		return fmt.Errorf("failed to download from S3: %w\n\nTo authenticate, run:\n  aws sso login\n\nOr configure AWS credentials with:\n  aws configure sso", err)
+	progress("Unsigned download failed, attempting signed download...")
+	// The CLI's transfer progress ("Completed X/Y ... with N file(s)
+	// remaining") must not reach stdout: callers like
+	// `ods audit ... --format=sarif` redirect our stdout into a report file,
+	// and stray progress lines corrupt it.
+	var capturedOutput strings.Builder
+	var cliOutput io.Writer = os.Stderr
+	if quiet {
+		cliOutput = &capturedOutput
+	}
+	cliErr := fetchWithAWSCLI(s3url, destPath, cliOutput, progress)
+	if cliErr == nil {
+		return nil
 	}
 
-	return nil
+	if quiet {
+		return fmt.Errorf("failed to download %s: unsigned attempt: %w; aws CLI attempt: %v: %s",
+			s3url, unsignedErr, cliErr, strings.TrimSpace(capturedOutput.String()))
+	}
+	return fmt.Errorf("failed to download from S3: %w\n\nTo authenticate, run:\n  aws sso login\n\nOr configure AWS credentials with:\n  aws configure sso", cliErr)
 }
 
 // fetchUnsigned attempts to download the file using an unsigned HTTP request.
-func fetchUnsigned(s3url *S3URL, destPath string) (err error) {
-	resp, err := http.Get(s3url.HTTPEndpoint())
+// It takes the endpoint as a string so tests can point it at a local server.
+func fetchUnsigned(endpoint string, destPath string, progress logFunc) (err error) {
+	resp, err := http.Get(endpoint)
 	if err != nil {
 		return fmt.Errorf("HTTP request failed: %w", err)
 	}
@@ -85,7 +133,7 @@ func fetchUnsigned(s3url *S3URL, destPath string) (err error) {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	// Create destination file
@@ -106,18 +154,16 @@ func fetchUnsigned(s3url *S3URL, destPath string) (err error) {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
-	log.Infof("Downloaded %s via unsigned request", humanizeBytes(written))
+	progress("Downloaded %s via unsigned request", humanizeBytes(written))
 	return nil
 }
 
-// fetchWithAWSCLI attempts to download the file using AWS CLI.
-func fetchWithAWSCLI(s3url string, destPath string) error {
+// fetchWithAWSCLI attempts to download the file using AWS CLI. Both CLI
+// streams go to cliOutput.
+func fetchWithAWSCLI(s3url string, destPath string, cliOutput io.Writer, progress logFunc) error {
 	cmd := exec.Command("aws", "s3", "cp", s3url, destPath)
-	// Send the CLI's transfer progress ("Completed X/Y ... with N file(s)
-	// remaining") to stderr, not stdout: callers like `ods audit ... --format=sarif`
-	// redirect our stdout into a report file, and stray progress lines corrupt it.
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = cliOutput
+	cmd.Stderr = cliOutput
 
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(destPath) // Clean up partial file
@@ -126,7 +172,7 @@ func fetchWithAWSCLI(s3url string, destPath string) error {
 
 	// Get file size for logging
 	if info, err := os.Stat(destPath); err == nil {
-		log.Infof("Downloaded %s via AWS CLI", humanizeBytes(info.Size()))
+		progress("Downloaded %s via AWS CLI", humanizeBytes(info.Size()))
 	}
 
 	return nil

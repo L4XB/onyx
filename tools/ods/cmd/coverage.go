@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/onyx-dot-app/onyx/tools/ods/internal/coverage"
+	"github.com/onyx-dot-app/onyx/tools/ods/internal/git"
 	"github.com/onyx-dot-app/onyx/tools/ods/internal/paths"
 	"github.com/onyx-dot-app/onyx/tools/ods/internal/testsuite"
 )
@@ -23,6 +24,11 @@ type CoverageOptions struct {
 	HTML      string
 	Markdown  string
 	Tolerance float64
+	// Base reports the run against the coverage snapshot of this commit-ish
+	// instead of the floors. The gate keeps using the floors.
+	Base           string
+	Publish        bool
+	SnapshotBucket string
 }
 
 // NewCoverageCommand creates a command that measures statement coverage for a
@@ -55,6 +61,12 @@ func NewCoverageCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.Markdown, "markdown", "", "Write the changed packages as a markdown table at this path, for a PR comment")
 	cmd.Flags().Float64Var(&opts.Tolerance, "tolerance", coverage.DefaultTolerance,
 		"Percentage points a package may drop below its floor without failing")
+	cmd.Flags().StringVar(&opts.Base, "base", "",
+		"Report against the coverage snapshot of this commit, or its nearest recorded ancestor, instead of the floors")
+	cmd.Flags().BoolVar(&opts.Publish, "publish", false,
+		"Record this run as the coverage snapshot of HEAD (needs AWS credentials)")
+	cmd.Flags().StringVar(&opts.SnapshotBucket, "snapshot-bucket", DefaultS3Bucket,
+		"S3 bucket that holds the coverage snapshots")
 
 	return cmd
 }
@@ -64,6 +76,12 @@ func NewCoverageCommand() *cobra.Command {
 func runCoverage(target string, opts *CoverageOptions) int {
 	if opts.Check && opts.Update {
 		log.Fatal("--check and --update do the opposite of each other; pass only one")
+	}
+	if opts.Base != "" && opts.Update {
+		log.Fatal("--base reports against a snapshot, --update rewrites the floors; pass only one")
+	}
+	if opts.Publish && opts.Update {
+		log.Fatal("--publish records this run as a snapshot, --update rewrites the floors; pass only one")
 	}
 	if err := coverage.ValidateTolerance(opts.Tolerance); err != nil {
 		log.Fatalf("Invalid --tolerance: %v", err)
@@ -122,18 +140,27 @@ func runCoverage(target string, opts *CoverageOptions) int {
 		return writeBaseline(baselinePath, profile)
 	}
 
-	// A module opts into the gate by committing a baseline. Without one the
-	// tests still run and the report still prints, but nothing can regress.
-	baseline, err := coverage.LoadBaseline(baselinePath)
-	if errors.Is(err, os.ErrNotExist) {
-		log.Warnf("No baseline at %s, so nothing is gated. Opt in with: ods coverage %s --update", baselinePath, suite.Name)
-		baseline = nil
-	} else if err != nil {
-		log.Errorf("Failed to read the baseline: %v", err)
-		return 1
+	floorReference, code := loadFloorReference(baselinePath, suite.Name)
+	if code != 0 {
+		return code
 	}
 
-	report := coverage.Compare(profile, baseline, opts.Tolerance)
+	// The gate always compares against the committed floors. --base only
+	// changes what the report shows.
+	gateReport := coverage.Compare(profile, floorReference, opts.Tolerance)
+	report := gateReport
+
+	store := coverage.NewS3SnapshotStore(opts.SnapshotBucket, suite.Dir)
+	if opts.Base != "" {
+		baseReference, code := locateBaseReference(opts.Base, store)
+		if code != 0 {
+			return code
+		}
+		if baseReference != nil {
+			report = coverage.Compare(profile, baseReference, opts.Tolerance)
+		}
+	}
+
 	if err := coverage.WriteReport(os.Stdout, report); err != nil {
 		log.Errorf("Failed to write the report: %v", err)
 		return 1
@@ -152,25 +179,97 @@ func runCoverage(target string, opts *CoverageOptions) int {
 		log.Infof("Browse it with: go tool cover -html=%s", profilePath)
 	}
 
-	if improvements := report.Improvements(); len(improvements) > 0 {
+	if improvements := gateReport.Improvements(); len(improvements) > 0 {
 		log.Infof("%d package(s) rose above the baseline. Lock the gain in with: ods coverage %s --update",
 			len(improvements), suite.Name)
 	}
 
-	if !opts.Check || baseline == nil {
+	if code := gateCoverage(opts, suite.Name, baselinePath, floorReference, gateReport); code != 0 {
+		return code
+	}
+
+	// Publishing runs last: a snapshot describes a run whose tests and gate
+	// both passed.
+	if opts.Publish {
+		return publishSnapshot(store, profile, suite.Dir)
+	}
+	return 0
+}
+
+// loadFloorReference reads the committed floors. A module opts into the gate
+// by committing a baseline. Without one the tests still run and the report
+// still prints, but nothing can regress.
+func loadFloorReference(baselinePath, suiteName string) (*coverage.Reference, int) {
+	baseline, err := coverage.LoadBaseline(baselinePath)
+	if errors.Is(err, os.ErrNotExist) {
+		log.Warnf("No baseline at %s, so nothing is gated. Opt in with: ods coverage %s --update", baselinePath, suiteName)
+		return nil, 0
+	}
+	if err != nil {
+		log.Errorf("Failed to read the baseline: %v", err)
+		return nil, 1
+	}
+	return baseline.Reference(), 0
+}
+
+// locateBaseReference finds the snapshot to report against. A missing snapshot
+// is normal, for example on a fork pull request that holds no credentials, so
+// it warns and returns a nil reference to keep the floors.
+func locateBaseReference(rev string, store coverage.SnapshotStore) (*coverage.Reference, int) {
+	match, err := coverage.LocateBaseSnapshot(rev, coverage.GitCommitHistory{}, store, coverage.DefaultBaseWalkLimit)
+	if errors.Is(err, coverage.ErrBaseSnapshotUnavailable) {
+		log.Warnf("%v; reporting against the floors", err)
+		return nil, 0
+	}
+	if err != nil {
+		log.Errorf("Failed to look up the base coverage snapshot: %v", err)
+		return nil, 1
+	}
+
+	log.Infof("Reporting against the snapshot of %s", coverage.ShortCommit(match.Commit))
+	if match.Distance > 0 {
+		log.Infof("The base %s has no snapshot; the nearest recorded ancestor is %d commit(s) back",
+			coverage.ShortCommit(match.Base), match.Distance)
+	}
+	return match.Snapshot.Reference(), 0
+}
+
+// gateCoverage fails the run when a package fell below its floor.
+func gateCoverage(opts *CoverageOptions, suiteName, baselinePath string, floorReference *coverage.Reference, gateReport *coverage.Report) int {
+	if !opts.Check || floorReference == nil {
 		return 0
 	}
-	regressions := report.Regressions()
+	regressions := gateReport.Regressions()
 	if len(regressions) == 0 {
 		log.Infof("Coverage holds at or above the baseline in %s", baselinePath)
 		return 0
 	}
 	for _, regression := range regressions {
-		log.Errorf("%s fell to %.1f%%, below its %.1f%% floor", regression.Package, regression.Percent, regression.Floor)
+		log.Errorf("%s fell to %.1f%%, below its %.1f%% floor", regression.Package, regression.Percent, regression.Reference)
 	}
 	log.Errorf("Coverage regressed in %d package(s). Add tests, or justify the drop and run: ods coverage %s --update",
-		len(regressions), suite.Name)
+		len(regressions), suiteName)
 	return 1
+}
+
+// publishSnapshot records this run as the coverage snapshot of HEAD.
+func publishSnapshot(store *coverage.S3SnapshotStore, profile *coverage.Profile, module string) int {
+	// A snapshot is keyed by commit, so it must describe that commit alone.
+	if git.HasUncommittedChanges() {
+		log.Errorf("Refusing to publish a snapshot: the working tree has uncommitted changes")
+		return 1
+	}
+	commit, err := git.ResolveCommit("HEAD")
+	if err != nil {
+		log.Errorf("Failed to resolve HEAD: %v", err)
+		return 1
+	}
+	if err := store.Publish(coverage.NewSnapshot(profile, commit, module)); err != nil {
+		log.Errorf("Failed to publish the coverage snapshot: %v", err)
+		return 1
+	}
+	log.Infof("Published the coverage snapshot of %s to %s", coverage.ShortCommit(commit), store.ObjectURL(commit))
+	return 0
 }
 
 func writeBaseline(baselinePath string, profile *coverage.Profile) int {
@@ -245,11 +344,18 @@ CI keeps coverage from regressing. After adding tests, --update raises the floor
 Coverage is per package: a package's number counts only its own tests, so it is a
 number that package's owner can act on.
 
+--base reports against the coverage snapshot of a commit, or of its nearest
+recorded ancestor, instead of against the floors, which shows what a branch
+changed. A missing snapshot only warns: the report falls back to the floors.
+--publish records a successful run as the snapshot of HEAD. Neither flag
+changes what --check gates on.
+
 Examples:
   ods coverage ods                  # report where each package stands
   ods coverage ods --check          # fail on a regression (what CI runs)
   ods coverage ods --update         # record today's numbers as the new floors
   ods coverage ods --profile /tmp/cover.out
+  ods coverage ods --base origin/main   # report what this branch changed
 
 Suites:`)
 	for _, suite := range testsuite.All() {

@@ -22,7 +22,7 @@ func WriteMarkdown(w io.Writer, name string, report *Report) error {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "%s\n#### `%s`\n\n%s\n\n", markdownMarker(report), name, markdownSummary(report))
-	b.WriteString("| Package | Coverage | Floor | Change |\n| --- | ---: | ---: | --- |\n")
+	fmt.Fprintf(&b, "| Package | Coverage | %s | Change |\n| --- | ---: | ---: | --- |\n", referenceColumn(report))
 	for _, pkg := range report.Packages {
 		if pkg.Status != StatusOK {
 			b.WriteString(markdownRow(pkg))
@@ -62,9 +62,12 @@ func markdownSummary(report *Report) string {
 		}
 	}
 
-	total := fmt.Sprintf("Total coverage is %.1f%% (%+.1f against the baseline).",
-		report.Total.Percent, report.Total.Percent-report.Total.Floor)
+	total := fmt.Sprintf("Total coverage is %.1f%% (%+.1f against %s).",
+		report.Total.Percent, report.Total.Percent-report.Total.Reference, referenceName(report))
 	if len(parts) == 0 {
+		if comparedAgainstBase(report) {
+			return fmt.Sprintf("No package moved against %s. %s", referenceName(report), total)
+		}
 		return "Every package holds at its floor. " + total
 	}
 	return fmt.Sprintf("Packages: %s. %s", strings.Join(parts, ", "), total)
@@ -72,23 +75,23 @@ func markdownSummary(report *Report) string {
 
 func markdownRow(result Result) string {
 	percent := fmt.Sprintf("%.1f%%", result.Percent)
-	floor := fmt.Sprintf("%.1f%%", result.Floor)
+	reference := fmt.Sprintf("%.1f%%", result.Reference)
 	change := ""
 
 	switch result.Status {
 	case StatusNew:
-		floor = ""
+		reference = ""
 		change = "new"
 	case StatusRemoved:
 		percent = ""
 		change = "removed"
 	case StatusRegressed:
-		change = fmt.Sprintf("**regressed by %.1f**", result.Floor-result.Percent)
+		change = fmt.Sprintf("**regressed by %.1f**", result.Reference-result.Percent)
 	case StatusImproved:
-		change = fmt.Sprintf("+%.1f", result.Percent-result.Floor)
+		change = fmt.Sprintf("+%.1f", result.Percent-result.Reference)
 	}
 
-	return fmt.Sprintf("| %s | %s | %s | %s |\n", result.Package, percent, floor, change)
+	return fmt.Sprintf("| %s | %s | %s | %s |\n", result.Package, percent, reference, change)
 }
 
 func markdownTotalRow(result Result) string {
@@ -96,5 +99,28 @@ func markdownTotalRow(result Result) string {
 		return fmt.Sprintf("| **total** | **%.1f%%** | | |\n", result.Percent)
 	}
 	return fmt.Sprintf("| **total** | **%.1f%%** | %.1f%% | %+.1f |\n",
-		result.Percent, result.Floor, result.Percent-result.Floor)
+		result.Percent, result.Reference, result.Percent-result.Reference)
+}
+
+// comparedAgainstBase reports whether the report compares against a base
+// commit's snapshot rather than the committed floors.
+func comparedAgainstBase(report *Report) bool {
+	return report.Reference != nil && report.Reference.Kind == ReferenceBase
+}
+
+// referenceColumn is the header of the column holding the reference values.
+func referenceColumn(report *Report) string {
+	if comparedAgainstBase(report) {
+		return "Base"
+	}
+	return "Floor"
+}
+
+// referenceName names the reference in a sentence. Both summary sentences use
+// it, so the two wordings cannot drift apart.
+func referenceName(report *Report) string {
+	if comparedAgainstBase(report) {
+		return fmt.Sprintf("base `%s`", report.Reference.Label)
+	}
+	return "the baseline"
 }

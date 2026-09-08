@@ -94,6 +94,16 @@ func NewBaseline(profile *Profile) *Baseline {
 	return baseline
 }
 
+// Reference makes the committed floors the target of a comparison.
+func (b *Baseline) Reference() *Reference {
+	return &Reference{
+		Kind:     ReferenceFloor,
+		Label:    "floor",
+		Total:    b.Total,
+		Packages: b.Packages,
+	}
+}
+
 // Save writes the baseline to disk. yaml.v3 sorts map keys, so the output is
 // stable across runs and diffs stay readable.
 func (b *Baseline) Save(path string) error {
